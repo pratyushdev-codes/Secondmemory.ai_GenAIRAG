@@ -113,7 +113,7 @@ def create_tools():
     # Web Tool
     try:
         loader = WebBaseLoader(
-            "https://docs.smith.langchain.com/",
+            "https://news.google.com/home?hl=en-IN&gl=IN&ceid=IN:en",
             verify_ssl=False,
             requests_kwargs={"timeout": 10}
         )
@@ -151,7 +151,7 @@ def create_tools():
 def get_conversational_chain():
     llm = ChatGoogleGenerativeAI(
         model="gemini-1.5-flash",
-        temperature=0.7,
+        temperature=0.5,
         top_p=0.9,
         top_k=40,
         max_output_tokens=2048
