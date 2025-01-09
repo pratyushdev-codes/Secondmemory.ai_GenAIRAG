@@ -12,9 +12,11 @@ from langchain_community.document_loaders import WebBaseLoader
 from langchain.tools.retriever import create_retriever_tool
 from langchain.agents import AgentExecutor, initialize_agent, AgentType, Tool
 from langchain.memory import ConversationBufferMemory
-from dotenv import load_dotenv
-import os.path
-
+from langchain.schema import Document
+from time import sleep
+from typing import List
+import time
+from dotenv import load_dotenv 
 # Load environment variables
 load_dotenv()
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
@@ -31,32 +33,99 @@ def get_pdf_text(pdf_docs):
             text += page.extract_text() or ""
     return text
 
-def get_text_chunks(text):
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50,
+def create_semantic_chunks(text: str, chunk_size: int = 512, overlap: int = 50) -> List[Document]:
+    """
+    Creates semantically meaningful chunks using a hybrid approach of recursive splitting
+    and content-based segmentation
+    """
+    # First, split into major semantic units (e.g., paragraphs)
+    initial_splits = text.split('\n\n')
+    
+    # Create a more sophisticated text splitter
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=overlap,
         length_function=len,
-        separators=["\n\n", "\n", " ", ""]
+        separators=["\n\n", "\n", ". ", ", ", " ", ""],
+        is_separator_regex=False
     )
-    return text_splitter.split_text(text)
+    
+    documents = []
+    
+    for i, section in enumerate(initial_splits):
+        if not section.strip():
+            continue
+            
+        try:
+            # Further split large sections while preserving semantic meaning
+            if len(section) > chunk_size:
+                chunks = splitter.split_text(section)
+                for chunk in chunks:
+                    if chunk.strip():  # Only add non-empty chunks
+                        documents.append(Document(
+                            page_content=chunk,
+                            metadata={
+                                "source": f"section_{i}",
+                                "chunk_type": "split_chunk"
+                            }
+                        ))
+            else:
+                # Keep smaller sections intact to preserve context
+                documents.append(Document(
+                    page_content=section,
+                    metadata={
+                        "source": f"section_{i}",
+                        "chunk_type": "full_section"
+                    }
+                ))
+                
+        except Exception as e:
+            st.warning(f"Error processing section {i}: {str(e)}")
+            continue
+            
+        # Add small delay to avoid rate limiting
+        time.sleep(0.1)
+    
+    return documents
 
-def get_vector_store(text_chunks):
+def get_vector_store(documents: List[Document]):
+    """Create and save vector store from documents"""
     embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    if not text_chunks:
+    if not documents:
         return None
     
     try:
-        vector_store = FAISS.from_texts(
-            text_chunks, 
-            embedding=embeddings,
-            metadatas=[{"source": f"chunk_{i}"} for i in range(len(text_chunks))]
-        )
-        vector_store.save_local("faiss_index")
-        st.session_state.pdf_processed = True
-        return vector_store
+        # Add retry mechanism for vector store creation
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                vector_store = FAISS.from_documents(
+                    documents,
+                    embedding=embeddings
+                )
+                vector_store.save_local("faiss_index")
+                st.session_state.pdf_processed = True
+                return vector_store
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise e
+                time.sleep(2 ** attempt)  # Exponential backoff
+                
     except Exception as e:
         st.error(f"Error creating vector store: {str(e)}")
         return None
+
+def process_documents(text: str) -> FAISS:
+    """Process documents using semantic chunking and create vector store"""
+    # Create semantic chunks
+    documents = create_semantic_chunks(text)
+    
+    if not documents:
+        st.error("No valid chunks were created from the documents")
+        return None
+    
+    # Create and return vector store
+    return get_vector_store(documents)
 
 def search_pdfs(query: str) -> str:
     """Search through uploaded PDFs for relevant information."""
@@ -80,6 +149,12 @@ def search_pdfs(query: str) -> str:
             
     except Exception as e:
         return f"ERROR: {str(e)}"
+
+def process_web_content(loader: WebBaseLoader) -> List[Document]:
+    """Process web content using semantic chunking"""
+    docs = loader.load()
+    text = "\n\n".join([doc.page_content for doc in docs])
+    return create_semantic_chunks(text)
 
 def create_tools():
     tools = []
@@ -113,13 +188,11 @@ def create_tools():
     # Web Tool
     try:
         loader = WebBaseLoader(
-            "https://news.google.com/home?hl=en-IN&gl=IN&ceid=IN:en",
+            "https://www.langchain.com/langsmith",
             verify_ssl=False,
             requests_kwargs={"timeout": 10}
         )
-        docs = loader.load()
-        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-        documents = splitter.split_documents(docs)
+        documents = process_web_content(loader)
         
         embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
         vectordb = FAISS.from_documents(documents, embeddings)
@@ -135,6 +208,34 @@ def create_tools():
         tools.append(web_tool)
     except Exception as e:
         st.warning(f"Web tool creation failed: {str(e)}")
+    
+    # News Tool
+    try:
+        urls = [
+            "https://news.google.com/home?hl=en-IN&gl=IN&ceid=IN:en",
+        ]
+        
+        loader = WebBaseLoader(
+            urls,
+            verify_ssl=False,
+            requests_kwargs={"timeout": 10}
+        )
+        documents = process_web_content(loader)
+        
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+        vectordb = FAISS.from_documents(documents, embeddings)
+        retriever = vectordb.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": 3}
+        )
+        news_tool = create_retriever_tool(
+            retriever,
+            "news_search",
+            "Search for recent news, Top news, trends, real-time updates. Use this for News and real-time knowledge"
+        )
+        tools.append(news_tool)
+    except Exception as e:
+        st.warning(f"News tool creation failed: {str(e)}")
     
     # PDF Tool
     pdf_tool = Tool(
@@ -223,8 +324,7 @@ def main():
                 with st.spinner("Processing PDFs..."):
                     try:
                         raw_text = get_pdf_text(pdf_docs)
-                        text_chunks = get_text_chunks(raw_text)
-                        vector_store = get_vector_store(text_chunks)
+                        vector_store = process_documents(raw_text)
                         if vector_store:
                             st.success("Documents processed successfully!")
                             st.session_state.agent_executor = get_conversational_chain()
